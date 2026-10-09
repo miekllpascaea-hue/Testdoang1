@@ -1,0 +1,22 @@
+{
+  "TIRZZ-FB393A3B": {
+    "amount": 10,
+    "maxUses": 10,
+    "usedBy": [],
+    "createdAt": "2026-08-11T14:35:47.074Z"
+  },
+  "TIRZZ-6BF8AAD8": {
+    "amount": 100,
+    "maxUses": 100,
+    "usedBy": [],
+    "createdAt": "2026-08-11T15:42:09.433Z"
+  },
+  "TIRZZ-C9B61A21": {
+    "amount": 9000,
+    "maxUses": 7,
+    "usedBy": [
+      6669673614
+    ],
+    "createdAt": "2026-08-13T01:42:07.323Z"
+  }
+}
