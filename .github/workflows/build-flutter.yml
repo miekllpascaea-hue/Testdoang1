@@ -1,0 +1,547 @@
+name: Worker 1 - Flutter Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID pekerjaan dari dispatcher"
+        required: false
+        default: ""
+        type: string
+      userId:
+        description: "ID pengguna dari dispatcher"
+        required: false
+        default: ""
+        type: string
+      payload:
+        description: "Payload dispatcher; dapat berisi URL ZIP"
+        required: false
+        default: ""
+        type: string
+      zip_url:
+        description: "URL ZIP project Flutter"
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: "Tag build"
+        required: false
+        default: ""
+        type: string
+      build_type:
+        description: "debug atau release"
+        required: false
+        default: "release"
+        type: string
+      only_analyze:
+        description: "true untuk analyze saja"
+        required: false
+        default: "false"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: flutter-build-${{ inputs.jobId != '' && inputs.jobId || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Job identity
+        run: |
+          set -euo pipefail
+          echo "Worker 1 started"
+          echo "RUN_ID=${GITHUB_RUN_ID}"
+          echo "RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT}"
+          echo "JOB_NAME=${GITHUB_JOB}"
+          mkdir -p build_logs
+          cat > build_logs/worker-status.json <<EOF
+          {"status":"started","run_id":"${GITHUB_RUN_ID}","run_attempt":"${GITHUB_RUN_ATTEMPT}","job":"${GITHUB_JOB}"}
+          EOF
+
+      - name: Resolve actual GitHub Job ID automatically
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYJOB'
+          import json, os, time
+          from urllib.request import Request, urlopen
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ.get("GH_TOKEN", "")
+          api = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
+          headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+
+          found = None
+          last_error = None
+          for attempt in range(1, 11):
+              try:
+                  req = Request(api, headers=headers)
+                  with urlopen(req, timeout=20) as response:
+                      data = json.loads(response.read().decode("utf-8"))
+                  jobs = data.get("jobs", [])
+                  # Prefer the current Build APK job, then the currently running job.
+                  candidates = [j for j in jobs if j.get("name") == "Build APK" and j.get("status") == "in_progress"]
+                  if not candidates:
+                      candidates = [j for j in jobs if j.get("status") == "in_progress"]
+                  if candidates:
+                      found = candidates[0]
+                      break
+                  last_error = "GitHub API belum menampilkan job yang sedang berjalan"
+              except Exception as exc:
+                  last_error = str(exc)
+              if attempt < 10:
+                  time.sleep(3)
+
+          if found and found.get("id"):
+              job_id = str(found["id"])
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+                  env.write(f"GITHUB_JOB_ID={job_id}\n")
+              print(f"Resolved Run ID={run_id}, Job ID={job_id}, job={found.get('name', '')}")
+              with open("github-job-identity.json", "w", encoding="utf-8") as out:
+                  json.dump({"run_id": run_id, "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""), "job_id": job_id, "job_name": found.get("name", "")}, out, indent=2)
+          else:
+              # Do not fail the build just because the API has not surfaced the job yet.
+              print(f"::warning::Job ID belum tersedia dari GitHub API: {last_error or 'unknown error'}")
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+                  env.write("GITHUB_JOB_ID=\n")
+              # Ensure the identity artifact exists even if GitHub's API is delayed.
+              with open("github-job-identity.json", "w", encoding="utf-8") as out:
+                  json.dump({"run_id": run_id, "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""), "job_id": "", "job_name": os.environ.get("GITHUB_JOB", ""), "job_id_resolution": "unavailable", "error": last_error or "unknown error"}, out, indent=2)
+          PYJOB
+
+      - name: Resolve inputs
+        env:
+          INPUT_ZIP_URL: ${{ inputs.zip_url }}
+          INPUT_PAYLOAD: ${{ inputs.payload }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_JOB_ID: ${{ inputs.jobId }}
+          INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+          INPUT_ONLY_ANALYZE: ${{ inputs.only_analyze }}
+        run: |
+          set -euo pipefail
+          python3 - "$INPUT_ZIP_URL" "$INPUT_PAYLOAD" "$INPUT_TAG" "$INPUT_JOB_ID" "$INPUT_BUILD_TYPE" "$INPUT_ONLY_ANALYZE" <<'PY'
+          import json, os, re, sys
+          from urllib.parse import urlparse
+
+          zip_arg, payload_arg, tag_arg, job_arg, build_arg, analyze_arg = sys.argv[1:]
+
+          def find_value(obj, keys):
+              if isinstance(obj, dict):
+                  for key in keys:
+                      value = obj.get(key)
+                      if isinstance(value, str) and value.strip():
+                          return value.strip()
+                  for value in obj.values():
+                      found = find_value(value, keys)
+                      if found:
+                          return found
+              elif isinstance(obj, list):
+                  for value in obj:
+                      found = find_value(value, keys)
+                      if found:
+                          return found
+              elif isinstance(obj, str):
+                  value = obj.strip()
+                  if value.startswith(("{", "[")):
+                      try:
+                          return find_value(json.loads(value), keys)
+                      except Exception:
+                          pass
+              return ""
+
+          payload = payload_arg.strip()
+          zip_url = zip_arg.strip()
+
+          if not zip_url and payload:
+              try:
+                  payload_data = json.loads(payload)
+                  zip_url = find_value(payload_data, [
+                      "zip_url", "zipUrl", "download_url", "downloadUrl",
+                      "file_url", "fileUrl", "source_url", "sourceUrl", "url"
+                  ])
+              except Exception:
+                  match = re.search(r'https?://[^\s"\\]+', payload, re.I)
+                  if match:
+                      zip_url = match.group(0).rstrip("`'.,)")
+
+          if not zip_url:
+              raise SystemExit("::error::URL ZIP tidak ditemukan.")
+
+          parsed = urlparse(zip_url)
+          if parsed.scheme not in ("http", "https") or not parsed.netloc:
+              raise SystemExit("::error::URL ZIP tidak valid.")
+
+          payload_tag = payload_build = payload_analyze = ""
+          if payload:
+              try:
+                  payload_data = json.loads(payload)
+                  payload_tag = find_value(payload_data, ["tag", "build_tag", "buildTag"])
+                  payload_build = find_value(payload_data, ["build_type", "buildType"])
+                  payload_analyze = find_value(payload_data, ["only_analyze", "onlyAnalyze"])
+              except Exception:
+                  pass
+
+          raw_tag = tag_arg.strip() or payload_tag or job_arg.strip() or os.environ["GITHUB_RUN_ID"]
+          tag = raw_tag if raw_tag.startswith("build-") else "build-" + raw_tag
+          tag = re.sub(r"[^A-Za-z0-9._-]+", "-", tag)[:80] or "build"
+
+          build_type = (build_arg.strip() or payload_build or "release").lower()
+          if build_type not in ("release", "debug"):
+              build_type = "release"
+
+          only_analyze = (analyze_arg.strip() or payload_analyze).lower() == "true"
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"ZIP_URL={zip_url}\n")
+              env.write(f"BUILD_TAG={tag}\n")
+              env.write(f"BUILD_TYPE={build_type}\n")
+              env.write(f"ONLY_ANALYZE={'true' if only_analyze else 'false'}\n")
+
+          print(f"Resolved build_type={build_type} tag={tag} only_analyze={only_analyze}")
+          PY
+
+      - name: Download project ZIP
+        env:
+          ZIP_URL: ${{ env.ZIP_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, time
+          from urllib.parse import unquote
+          from urllib.request import Request, urlopen
+
+          url = os.environ["ZIP_URL"].strip()
+          token = os.environ.get("GH_RELEASE_TOKEN", "").strip() or os.environ.get("GITHUB_TOKEN", "").strip()
+          output = "project.zip"
+
+          def curl_download(target, headers=None):
+              command = [
+                  "curl", "-fL", "--retry", "5", "--retry-delay", "2",
+                  "--connect-timeout", "15", "--max-time", "300",
+              ]
+              for key, value in (headers or {}).items():
+                  command += ["-H", f"{key}: {value}"]
+              command += [target, "-o", output]
+              subprocess.run(command, check=True)
+
+          release_match = re.match(
+              r"^https?://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)$",
+              url,
+              re.I,
+          )
+
+          if release_match:
+              owner, repo, tag, asset = release_match.groups()
+              asset = unquote(asset.split("?")[0])
+              api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+
+              last_error = ""
+              for attempt in range(1, 19):
+                  try:
+                      request = Request(api_url, headers=headers)
+                      with urlopen(request, timeout=20) as response:
+                          release = json.loads(response.read().decode("utf-8"))
+                      asset_info = next(
+                          (item for item in release.get("assets", []) if item.get("name") == asset),
+                          None,
+                      )
+                      if not asset_info:
+                          raise RuntimeError(f"asset {asset!r} belum tersedia")
+                      if token and asset_info.get("url"):
+                          curl_download(
+                              asset_info["url"],
+                              {
+                                  "Authorization": f"Bearer {token}",
+                                  "Accept": "application/octet-stream",
+                              },
+                          )
+                      else:
+                          curl_download(asset_info["browser_download_url"])
+                      break
+                  except Exception as exc:
+                      last_error = str(exc)
+                      if attempt == 18:
+                          print(f"::error::Gagal mengambil GitHub Release: {last_error}")
+                          if not token:
+                              print("::error::Untuk repository private/berbeda, tambahkan secret GH_RELEASE_TOKEN.")
+                          sys.exit(1)
+                      time.sleep(3)
+          else:
+              curl_download(url)
+
+          if not os.path.isfile(output) or os.path.getsize(output) < 100:
+              raise SystemExit("::error::ZIP kosong/tidak valid.")
+          subprocess.run(["unzip", "-t", output], check=True, stdout=subprocess.DEVNULL)
+          print(f"ZIP valid: {os.path.getsize(output)} bytes")
+          PY
+
+      - name: Extract and prepare project
+        run: |
+          set -euo pipefail
+          rm -rf project
+          mkdir project
+          unzip -q project.zip -d project
+
+          # Cari root Flutter di ZIP, termasuk bila source berada beberapa folder di dalamnya.
+          mapfile -t pubspecs < <(find project -maxdepth 6 -type f -name pubspec.yaml -print)
+          if [ "${#pubspecs[@]}" -eq 0 ]; then
+            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP. Pastikan URL mengarah ke source project Flutter."
+            find project -maxdepth 4 -type f -print | head -n 200
+            exit 1
+          fi
+          if [ "${#pubspecs[@]}" -gt 1 ]; then
+            echo "::warning::Beberapa pubspec.yaml ditemukan; memilih yang paling dekat ke root ZIP."
+            pubspec="$(printf '%s\n' "${pubspecs[@]}" | awk '{ print length($0) "\t" $0 }' | sort -n | head -n 1 | cut -f2-)"
+          else
+            pubspec="${pubspecs[0]}"
+          fi
+          root="$(dirname "$pubspec")"
+          if [ "$root" != "project" ]; then
+            tmp="$(mktemp -d)"
+            cp -a "$root"/. "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+          test -f project/pubspec.yaml || { echo "::error::Root Flutter tidak ditemukan setelah ekstraksi."; exit 1; }
+          echo "Project root OK: $GITHUB_WORKSPACE/project"
+          ls -la project | head -n 100
+          if [ -f project/android/gradlew ]; then chmod +x project/android/gradlew; fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: project/android/**/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: stable
+          cache: true
+          cache-key: flutter-3.41.9-${{ runner.os }}
+
+      - name: Prepare project
+        working-directory: project
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics
+          if ! command -v flutter >/dev/null 2>&1; then
+            echo "::error::Flutter tidak tersedia setelah langkah Setup Flutter. Periksa log langkah Setup Flutter di GitHub Actions."
+            exit 1
+          fi
+          flutter --version
+          if [ ! -f android/gradlew ]; then
+            echo "::warning::android/gradlew tidak ditemukan. Flutter akan mencoba melengkapi file platform Android yang hilang."
+            # Do not delete the existing Android directory: let Flutter add missing
+            # platform files while retaining the project's existing source/config.
+            flutter create --platforms=android .
+          fi
+          if [ ! -f android/gradlew ]; then
+            echo "::error::Flutter tidak berhasil membuat android/gradlew. Periksa struktur ZIP dan log flutter create."
+            find android -maxdepth 4 -type f -print 2>/dev/null | head -n 150 || true
+            exit 1
+          fi
+          chmod +x android/gradlew
+          flutter pub get
+
+      - name: Configure fast Gradle settings
+        working-directory: project
+        run: |
+          set -euo pipefail
+          PROPS=android/gradle.properties
+          touch "$PROPS"
+          put() {
+            local key="$1"
+            local value="$2"
+            if grep -qE "^${key}=" "$PROPS"; then
+              sed -i "s#^${key}=.*#${key}=${value}#" "$PROPS"
+            else
+              printf '%s=%s\n' "$key" "$value" >> "$PROPS"
+            fi
+          }
+          put org.gradle.daemon true
+          put org.gradle.caching true
+          put org.gradle.parallel true
+          put org.gradle.workers.max 4
+          put org.gradle.jvmargs "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
+          put kotlin.incremental true
+          put android.useAndroidX true
+
+      - name: Analyze project
+        if: ${{ env.ONLY_ANALYZE == 'true' }}
+        working-directory: project
+        run: |
+          set -euo pipefail
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build APK
+        if: ${{ env.ONLY_ANALYZE != 'true' }}
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ env.BUILD_TYPE }}
+        run: |
+          set -o pipefail
+          mkdir -p build_logs
+          rm -f build_logs/flutter-build.log
+          echo "Build started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug --no-pub 2>&1 | tee build_logs/flutter-build.log
+          else
+            flutter build apk --release --no-shrink --no-pub 2>&1 | tee build_logs/flutter-build.log
+          fi
+
+          echo "Build finished: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+      - name: Collect diagnostics
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set +e
+          mkdir -p build_logs
+          collect_diagnostics() {
+            echo "===== DIAGNOSTICS ====="
+            date -u
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "job=${GITHUB_JOB}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "===== Flutter ====="
+            flutter --version
+            echo "===== Dart ====="
+            dart --version
+            echo "===== Java ====="
+            java -version
+            echo "===== Gradle ====="
+            if [ -f project/android/gradlew ]; then
+              bash project/android/gradlew --version
+            else
+              echo "project/android/gradlew tidak ditemukan"
+            fi
+            echo "===== Flutter Doctor ====="
+            flutter doctor -v
+            echo "===== Pub Dependencies ====="
+            flutter pub deps --style=compact
+            echo "===== APK ====="
+            find project/build/app/outputs -type f -name '*.apk' -print 2>/dev/null
+            echo "===== BUILD LOG (last 1200 lines) ====="
+            if [ -f project/build_logs/flutter-build.log ]; then
+              tail -n 1200 project/build_logs/flutter-build.log
+            elif [ -f build_logs/flutter-build.log ]; then
+              tail -n 1200 build_logs/flutter-build.log
+            else
+              echo "flutter-build.log belum dibuat; kegagalan terjadi sebelum atau saat persiapan tahap Build APK."
+            fi
+            echo "===== GRADLE REPORTS ====="
+            find project/android -type f \
+              \( -path '*/build/reports/*' -o -name '*.log' \) \
+              -print 2>/dev/null | head -n 200
+          }
+          collect_diagnostics > build_logs/build-diagnostics.txt 2>&1
+          cat build_logs/build-diagnostics.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build_logs/**
+            project/build_logs/**
+            project/android/**/build/reports/**
+            project/android/**/build/**/*.log
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
+
+      - name: Verify APK
+        if: ${{ env.ONLY_ANALYZE != 'true' }}
+        working-directory: project
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(build/app/outputs/flutter-apk/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::Build selesai tetapi APK tidak ditemukan."
+            exit 1
+          fi
+          APK="${apks[0]}"
+          test -s "$APK"
+          # Upload APK runs from the workspace root, not the project directory.
+          # Export an absolute path so upload-artifact resolves the same file.
+          APK_ABSOLUTE="$GITHUB_WORKSPACE/project/$APK"
+          test -s "$APK_ABSOLUTE"
+          echo "APK=$APK_ABSOLUTE" >> "$GITHUB_ENV"
+          echo "APK berhasil dibuat: $APK_ABSOLUTE"
+          ls -lh "$APK_ABSOLUTE"
+
+      - name: Upload APK
+        if: ${{ env.ONLY_ANALYZE != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ env.BUILD_TAG }}
+          path: ${{ env.APK }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Finalize worker result
+        if: always()
+        env:
+          BUILD_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          mkdir -p worker_result
+          cat > worker_result/result.json <<EOF
+          {
+            "status": "${BUILD_STATUS}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_attempt": "${GITHUB_RUN_ATTEMPT}",
+            "job": "${GITHUB_JOB}",
+            "github_job_id": "${GITHUB_JOB_ID:-}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "server": "${GITHUB_SERVER_URL}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "build_tag": "${BUILD_TAG:-}",
+            "artifact": "apk-${BUILD_TAG:-}",
+            "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+          echo "===== WORKER RESULT =====" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat worker_result/result.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload worker result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker1-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            worker_result/result.json
+            github-job-identity.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
